@@ -33,7 +33,7 @@ def obtener_noticias():
         
         # 4. Pedir a Gemini que resuma (Formato corto para TikTok)
         prompt = f"Resume esta noticia para TikTok en 15 palabras: {primera_noticia.title}"
-        response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         
         return [{
             "id": 1,
@@ -45,4 +45,5 @@ def obtener_noticias():
     except Exception as e:
         # Esto te dirá el error real en la pantalla en lugar de "Internal Server Error"
         return [{"titulo": "Error de Python", "resumen": str(e), "emoji": "⚠️"}]
+
 
