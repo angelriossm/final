@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import re
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
@@ -20,14 +21,21 @@ app.add_middleware(
 )
 
 # --- MEMORIA (CACHÉ) ---
-# Guarda las noticias 15 minutos para no gastar peticiones si recargas mucho
 CACHE_NOTICIAS = []
 ULTIMA_ACTUALIZACION = 0
-TIEMPO_CACHE = 900 
+TIEMPO_CACHE = 900  # 15 minutos
+
+def limpiar_json(texto):
+    """Limpia la respuesta de la IA para obtener solo el JSON."""
+    texto = re.sub(r'```json\s*|\s*```', '', texto).strip()
+    match = re.search(r'\{.*\}', texto, re.DOTALL)
+    if match:
+        return match.group(0)
+    return texto
 
 @app.get("/")
 def home():
-    return {"status": "Online", "model": "Gemini 2.5 Flash Lite", "mensaje": "Usa /noticias"}
+    return {"status": "Online", "style": "Minimalist Color", "mensaje": "Usa /noticias"}
 
 @app.get("/noticias")
 def obtener_noticias():
@@ -35,67 +43,77 @@ def obtener_noticias():
     
     ahora = time.time()
     
-    # 1. Verificar Caché (Ahorra peticiones y tiempo)
+    # 1. Verificar Caché
     if CACHE_NOTICIAS and (ahora - ULTIMA_ACTUALIZACION < TIEMPO_CACHE):
         print("⚡ Usando caché (Memoria rápida)")
         return CACHE_NOTICIAS
 
-    # 2. Llamar a la IA si el caché expiró
+    # 2. Llamar a la IA
     try:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            return [{"titulo": "Error Config", "resumen": "Falta la API KEY", "emoji": "❌"}]
+            return [{"titulo": "Error Config", "que_paso": "Falta API KEY", "sentimiento": "Negativo"}]
 
         client = genai.Client(api_key=api_key)
         
-        # Fuente RSS
         rss_url = "https://es.investing.com/rss/news.rss"
         feed = feedparser.parse(rss_url)
-        entradas = feed.entries[:5] # Analizamos 5 noticias
+        entradas = feed.entries[:5]
         noticias_procesadas = []
 
         for entry in entradas:
+            # --- PROMPT SIN EMOJIS Y CON SENTIMIENTO ---
             prompt = f"""
-            Eres un editor de noticias financieras virales. Resume esto: '{entry.title}'.
-            SALIDA JSON EXACTA:
+            Analiza esta noticia financiera: '{entry.title} - {entry.description}'.
+            
+            Actúa como un analista financiero senior de alto nivel.
+            Tu tono es serio, directo y minimalista. NO uses emojis ni lenguaje sensacionalista.
+            
+            Genera un JSON con estos campos exactos:
             {{
-                "titulo": "Título clickbait corto",
-                "resumen": "Resumen muy breve (max 15 palabras) para gente joven.",
-                "emoji": "Un solo emoji",
-                "impacto": "Positivo, Negativo o Neutro"
+                "titulo": "Título profesional y sobrio (máx 8 palabras)",
+                "que_paso": "Resumen ejecutivo del evento (máx 25 palabras)",
+                "por_que_importa": "Análisis de la implicación financiera (máx 25 palabras)",
+                "sentimiento": "Debe ser exactamente uno de estos tres: 'Positivo', 'Negativo', 'Neutro'",
+                "impacto": "Número entero del 1 al 10 indicando la fuerza del movimiento"
             }}
             """
             
-            # --- AQUÍ ESTÁ EL CAMBIO AL MODELO LITE ---
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-lite", 
-                contents=prompt
-            )
-            
-            # Limpieza del JSON
-            texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
-            datos_ia = json.loads(texto_limpio)
-            
-            noticias_procesadas.append({
-                "id": entry.link,
-                "titulo": datos_ia.get("titulo", entry.title),
-                "resumen": datos_ia.get("resumen", "Ver más..."),
-                "emoji": datos_ia.get("emoji", "⚡"),
-                "impacto": datos_ia.get("impacto", "Neutro"),
-                "link": entry.link
-            })
+            try:
+                # Usamos el modelo Lite para velocidad
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash-lite", 
+                    contents=prompt
+                )
+                
+                texto_limpio = limpiar_json(response.text)
+                datos_ia = json.loads(texto_limpio)
+                
+                noticias_procesadas.append({
+                    "id": entry.link,
+                    "titulo": datos_ia.get("titulo", entry.title),
+                    # Eliminamos el campo emoji
+                    "que_paso": datos_ia.get("que_paso", "No disponible"),
+                    "por_que_importa": datos_ia.get("por_que_importa", "No disponible"),
+                    "sentimiento": datos_ia.get("sentimiento", "Neutro"),
+                    "impacto": datos_ia.get("impacto", 5),
+                    "link": entry.link
+                })
+            except Exception as e_gemini:
+                print(f"Error IA: {e_gemini}")
+                continue
 
-        # Actualizar memoria
-        CACHE_NOTICIAS = noticias_procesadas
-        ULTIMA_ACTUALIZACION = ahora
+        if noticias_procesadas:
+            CACHE_NOTICIAS = noticias_procesadas
+            ULTIMA_ACTUALIZACION = ahora
         
         return noticias_procesadas
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error general: {e}")
         return [{
-            "titulo": "Error Técnico", 
-            "resumen": f"Algo falló: {str(e)}", 
-            "emoji": "⚠️", 
+            "titulo": "Error de Conexión", 
+            "que_paso": "No se pudo conectar con el servidor.",
+            "sentimiento": "Negativo",
             "link": "#"
         }]
