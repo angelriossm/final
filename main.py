@@ -1,154 +1,166 @@
 import os
-import time
 import json
-import re
+import random
 import feedparser
-from fastapi import FastAPI, Query
+from typing import Optional, Literal
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from google import genai
 from dotenv import load_dotenv
 
+# --- CONFIGURATION ---
 load_dotenv()
+app = FastAPI(title="FinNews AI Engine")
 
-app = FastAPI()
-
+# CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-# --- CACHÉ ---
-CACHE_PAGINAS = {}
-ULTIMA_ACTUALIZACION = 0
-TIEMPO_EXPIRACION = 900  # 15 minutos
+# --- DATA MODELS ---
+class ColorBlock(BaseModel):
+    texto: str
+    color: Literal["ROJO", "VERDE"]
 
-def limpiar_json(texto):
-    """Limpia el texto para extraer el bloque JSON"""
-    texto = re.sub(r'```json\s*|\s*```', '', texto).strip()
-    match = re.search(r'\[.*\]', texto, re.DOTALL) # Buscamos una LISTA []
-    return match.group(0) if match else texto
+class ImpactBlock(BaseModel):
+    nivel: Literal["ALTO", "MEDIO", "BAJO"]
+    color: Literal["ROJO", "VERDE"]
 
-# --- NUEVA FUNCIÓN: PROCESAMIENTO EN LOTE (BATCH) ---
-def analizar_bloque_noticias(client, lista_entradas):
-    """Envía 5 noticias juntas a Gemini para ahorrar llamadas y tiempo."""
+class AnalysisBlocks(BaseModel):
+    que_paso: ColorBlock
+    por_que_importa: ColorBlock
+    como_afecta_etfs_o_acciones: ColorBlock
+    que_hacer: ColorBlock
+
+class NewsResponse(BaseModel):
+    titulo: str
+    link_original: str
+    impacto_general: ImpactBlock
+    bloques: AnalysisBlocks
+
+# --- AI SERVICE ---
+def analyze_single_news(title: str, summary: str, link: str) -> Optional[NewsResponse]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set")
     
-    texto_combinado = ""
-    for i, entry in enumerate(lista_entradas):
-        resumen = getattr(entry, "summary", getattr(entry, "description", ""))
-        texto_combinado += f"--- NOTICIA {i+1} ---\nLink: {entry.link}\nTítulo: {entry.title}\nTexto: {resumen}\n\n"
+    client = genai.Client(api_key=api_key)
 
     prompt = f"""
-    Eres un mentor de inversiones para principiantes en México.
-    Analiza este BLOQUE de {len(lista_entradas)} noticias financieras.
-    
-    Tu objetivo: Filtrar el ruido y explicar si esto afecta al dinero de una persona normal.
+    Actúa como un motor de análisis financiero estricto. Analiza esta noticia:
+    Titulo: {title}
+    Resumen: {summary}
 
-    INPUT:
-    {texto_combinado}
+    Tu tarea es generar un JSON válido con la siguiente estructura exacta.
+    NO añadas markdown, ni ```json, solo el objeto JSON crudo.
 
-    INSTRUCCIONES DE SALIDA:
-    Devuelve estrictamente un JSON que sea una LISTA (Array) de objetos.
-    El orden debe corresponder exactamente a las noticias de entrada.
-    
-    Formato de cada objeto en la lista:
+    REGLAS DE COLOR:
+    - ROJO: Si hay riesgo, volatilidad, impacto negativo o relevancia crítica.
+    - VERDE: Si es positivo, neutral, sin impacto material o "ruido".
+
+    ESTRUCTURA JSON REQUERIDA:
     {{
-        "link_original": "El link provisto en la noticia (para mapear)",
-        "titulo": "Título ultra sencillo (máx 8 palabras)",
-        "que_paso": "Explicación simple (máx 20 palabras)",
-        "me_afecta": "Alta, Media, Baja o Nula",
-        "que_hacer": "Consejo de calma y mentalidad (NO financiero, máx 15 palabras)",
-        "ruido": "Mucho, Medio o Poco (¿Es chisme o es estructural?)",
-        "sentimiento": "Positivo, Negativo o Neutro",
-        "impacto": 1 al 10
+      "titulo": "Titulo breve (máx 8 palabras)",
+      "impacto_general": {{
+        "nivel": "ALTO | MEDIO | BAJO",
+        "color": "ROJO | VERDE"
+      }},
+      "bloques": {{
+        "que_paso": {{
+          "texto": "Descripción factual objetiva (máx 3 líneas).",
+          "color": "ROJO | VERDE"
+        }},
+        "por_que_importa": {{
+          "texto": "Relevancia macro/sectorial sin opinión.",
+          "color": "ROJO | VERDE"
+        }},
+        "como_afecta_etfs_o_acciones": {{
+          "texto": "Tickers o sectores específicos afectados.",
+          "color": "ROJO | VERDE"
+        }},
+        "que_hacer": {{
+          "texto": "Acción: Vigilar, Mantener, Esperar (Sin consejo financiero).",
+          "color": "ROJO | VERDE"
+        }}
+      }}
     }}
     """
-    
+
     try:
-        # Una sola llamada para procesar todo el bloque
         response = client.models.generate_content(
-            model="gemini-2.0-flash-lite", 
-            contents=prompt
+            model="gemini-2.0-flash-lite",
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
         )
-        json_str = limpiar_json(response.text)
-        datos_lista = json.loads(json_str)
-        return datos_lista
+        
+        data = json.loads(response.text)
+        # Inject original link as it's not generated by AI
+        data["link_original"] = link
+        return NewsResponse(**data)
     except Exception as e:
-        print(f"Error en batch IA: {e}")
-        return []
+        print(f"AI Error: {e}")
+        return None
 
-@app.get("/")
-def home():
-    return {"status": "OK", "mode": "Batch Optimization"}
+# --- RSS SERVICE ---
+RSS_SOURCES = [
+    "[https://es.investing.com/rss/news.rss](https://es.investing.com/rss/news.rss)",
+    "[https://feeds.content.dowjones.io/public/rss/mw_topstories](https://feeds.content.dowjones.io/public/rss/mw_topstories)",
+    "[https://cointelegraph.com/rss](https://cointelegraph.com/rss)"
+]
 
-@app.get("/feed")
-def obtener_feed(page: int = Query(1, ge=1)):
-    global CACHE_PAGINAS, ULTIMA_ACTUALIZACION
-
-    ahora = time.time()
+def get_raw_news_item(index: int):
+    # Flatten all feeds into one list (simplified for demo)
+    all_entries = []
+    for source in RSS_SOURCES:
+        try:
+            feed = feedparser.parse(source)
+            all_entries.extend(feed.entries)
+        except:
+            continue
     
-    # 1. Limpieza de caché por tiempo
-    if ahora - ULTIMA_ACTUALIZACION > TIEMPO_EXPIRACION:
-        CACHE_PAGINAS = {}
-        ULTIMA_ACTUALIZACION = ahora
+    # Sort by published date if available, else random shuffle to avoid stale top
+    all_entries.sort(key=lambda x: x.get('published_parsed', 0), reverse=True)
+    
+    if not all_entries:
+        return None
+    
+    # Modulo to loop infinitely through available news
+    safe_index = index % len(all_entries)
+    return all_entries[safe_index]
 
-    # 2. Respuesta rápida si está en caché
-    if page in CACHE_PAGINAS:
-        return CACHE_PAGINAS[page]
+# --- ENDPOINT ---
+@app.get("/news/next", response_model=NewsResponse)
+def get_next_news(index: int = Query(0, description="Pagination index for infinite scroll")):
+    """
+    Fetches a single news item based on the index, analyzes it with AI, 
+    and returns the structured JSON for the 2x2 grid UI.
+    """
+    raw_item = get_raw_news_item(index)
+    
+    if not raw_item:
+        raise HTTPException(status_code=503, detail="No news sources available")
 
-    try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            return {"error": "Falta API KEY"}
-        
-        client = genai.Client(api_key=api_key)
-        feed = feedparser.parse("https://es.investing.com/rss/news.rss")
+    # Extract text content
+    summary_text = getattr(raw_item, "summary", getattr(raw_item, "description", ""))
+    
+    # Process with AI
+    analyzed_news = analyze_single_news(
+        title=raw_item.title, 
+        summary=summary_text, 
+        link=raw_item.link
+    )
 
-        # Paginación
-        TAMANO = 5
-        inicio = (page - 1) * TAMANO
-        fin = inicio + TAMANO
+    if not analyzed_news:
+        raise HTTPException(status_code=500, detail="Error analyzing news content")
 
-        if inicio >= len(feed.entries):
-            return {"mensaje_dia": "Has leído todo por hoy.", "noticias": []}
+    return analyzed_news
 
-        # Seleccionamos el bloque de 5 noticias
-        bloque_entradas = feed.entries[inicio:fin]
-        
-        # --- AQUÍ OCURRE LA MAGIA DEL BATCH ---
-        # Enviamos las 5 juntas a la IA
-        analisis_ia = analizar_bloque_noticias(client, bloque_entradas)
-        
-        # Combinamos la respuesta de la IA con los datos originales (por seguridad)
-        noticias_finales = []
-        for i, entry in enumerate(bloque_entradas):
-            # Intentamos buscar el análisis correspondiente, si falla usamos fallback
-            dato = {}
-            if i < len(analisis_ia):
-                dato = analisis_ia[i]
-            
-            noticias_finales.append({
-                "id": entry.link,
-                "titulo": dato.get("titulo", entry.title),
-                "que_paso": dato.get("que_paso", "Analizando..."),
-                "me_afecta": dato.get("me_afecta", "Baja"),
-                "que_hacer": dato.get("que_hacer", "Mantén tu estrategia a largo plazo."),
-                "ruido": dato.get("ruido", "Medio"),
-                "sentimiento": dato.get("sentimiento", "Neutro"),
-                "impacto": dato.get("impacto", 5),
-                "link": entry.link
-            })
-
-        # Estructura de respuesta con el "Nivel Cero"
-        respuesta_completa = {
-            "mensaje_dia": "👋 Hola. Esto es lo que se mueve hoy en los mercados y cómo podría afectar tu bolsillo.",
-            "noticias": noticias_finales
-        }
-
-        CACHE_PAGINAS[page] = respuesta_completa
-        return respuesta_completa
-
-    except Exception as e:
-        print(f"Error server: {e}")
-        return {"mensaje_dia": "Error de conexión", "noticias": []}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
