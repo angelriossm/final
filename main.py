@@ -35,7 +35,7 @@ def limpiar_json(texto):
 
 @app.get("/")
 def home():
-    return {"status": "Online", "style": "Minimalist Color", "mensaje": "Usa /noticias"}
+    return {"status": "Online", "style": "Robust Mode", "mensaje": "Usa /noticias"}
 
 @app.get("/noticias")
 def obtener_noticias():
@@ -62,9 +62,12 @@ def obtener_noticias():
         noticias_procesadas = []
 
         for entry in entradas:
-            # --- PROMPT SIN EMOJIS Y CON SENTIMIENTO ---
+            # --- CORRECCIÓN DEL ERROR 'NO ATTRIBUTE' ---
+            # Intentamos obtener 'summary' o 'description', si no existen, usamos vacío.
+            resumen_rss = getattr(entry, "summary", getattr(entry, "description", ""))
+            
             prompt = f"""
-            Analiza esta noticia financiera: '{entry.title} - {entry.description}'.
+            Analiza esta noticia financiera: '{entry.title} - {resumen_rss}'.
             
             Actúa como un analista financiero senior de alto nivel.
             Tu tono es serio, directo y minimalista. NO uses emojis ni lenguaje sensacionalista.
@@ -80,7 +83,7 @@ def obtener_noticias():
             """
             
             try:
-                # Usamos el modelo Lite para velocidad
+                # Usamos el modelo Lite
                 response = client.models.generate_content(
                     model="gemini-2.5-flash-lite", 
                     contents=prompt
@@ -92,7 +95,6 @@ def obtener_noticias():
                 noticias_procesadas.append({
                     "id": entry.link,
                     "titulo": datos_ia.get("titulo", entry.title),
-                    # Eliminamos el campo emoji
                     "que_paso": datos_ia.get("que_paso", "No disponible"),
                     "por_que_importa": datos_ia.get("por_que_importa", "No disponible"),
                     "sentimiento": datos_ia.get("sentimiento", "Neutro"),
@@ -111,9 +113,12 @@ def obtener_noticias():
 
     except Exception as e:
         print(f"Error general: {e}")
+        # Devuelve un error visible en la App en lugar de romperla
         return [{
-            "titulo": "Error de Conexión", 
-            "que_paso": "No se pudo conectar con el servidor.",
-            "sentimiento": "Negativo",
+            "titulo": "Mantenimiento", 
+            "que_paso": "Estamos ajustando los servidores de noticias.",
+            "por_que_importa": "Intenta recargar en 1 minuto.",
+            "sentimiento": "Neutro",
+            "impacto": 1,
             "link": "#"
         }]
